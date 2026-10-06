@@ -9,7 +9,10 @@ from timm.models.deit import VisionTransformerDistilled
 
 
 class TokenSelector(nn.Module):
-    """Hard top-k in the forward pass, softmax surrogate in the backward pass.
+    """
+    Hard top-k in the forward pass, softmax surrogate in the backward pass.
+    The softmax surrogate simulates the gradient of the hard top-k selection, allowing gradients to flow through the selection process during backpropagation.
+    Note that the softmax surrogate is only used during training; during evaluation, the hard top-k selection is used directly.
 
     The MLP width is an explicit implementation choice: the paper specifies an
     MLP scorer but not its hidden width. Prefix tokens never enter this module.
@@ -20,10 +23,21 @@ class TokenSelector(nn.Module):
         if not 0 < keep_rate <= 1:
             raise ValueError("keep_rate must be in (0, 1].")
         self.keep_rate = keep_rate
-        self.scorer = nn.Sequential(nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, 1))
+        self.scorer = nn.Sequential(nn.Linear(dim, dim // 2), nn.GELU(), nn.Linear(dim // 2, 1)) # score gives one value per token, so scores has shape [B, N] (of [B, N, D] tokens). B is batch size, N is number of tokens, D is embedding dimension (position).
         if keep_rate == 1:
             self.scorer.requires_grad_(False)
 
+
+    """
+    forward value:       gate = hard
+    backward derivative: ∂gate/∂scores = ∂soft/∂scores
+    
+    Gather usage to return selected tokens (ex):
+    tokens:       [t0, t1, t2, t3, t4]
+    hard gate:    [ 0,  1,  0,  1,  0] (mask for top k tokens)
+    gated tokens: [ 0, t1,  0, t3,  0]
+    gather:       [t1, t3]
+    """
     def forward(self, tokens, temperature: float = 1.0):
         if temperature <= 0 or not math.isfinite(temperature):
             raise ValueError("temperature must be finite and positive.")
@@ -33,13 +47,14 @@ class TokenSelector(nn.Module):
             indices = torch.arange(count, device=tokens.device).expand(batch, -1)
             return tokens, indices
         # Float32 softmax is useful even when the backbone runs under autocast.
+        # Here wwe use a Gumbel trick to sample from the categorical distribution defined by the scores (shown to increase exploration).
         scores = self.scorer(tokens).squeeze(-1).float()
         if self.training:
             noise = -torch.empty_like(scores).exponential_().clamp_min_(1e-10).log()
             scores = scores + noise
-        soft = (scores / temperature).softmax(dim=-1)
-        indices = scores.topk(k, dim=-1).indices.sort(dim=-1).values
-        hard = torch.zeros_like(soft).scatter_(1, indices, 1.0)
+        soft = (scores / temperature).softmax(dim=-1) # Produces probbaility distribution over tokens
+        indices = scores.topk(k, dim=-1).indices.sort(dim=-1).values # Positions of top k tokens in the original sequence. Sort to preserve order of tokens in the original sequence.
+        hard = torch.zeros_like(soft).scatter_(1, indices, 1.0) # Hard selection of top k tokens, represented as a one-hot vector (1 for retained tokens). This is used in the forward pass.
         gate = hard - soft.detach() + soft if self.training else hard
         # Gather actually shortens the sequence; a zero mask alone would not.
         selected = (tokens * gate.to(tokens.dtype).unsqueeze(-1)).gather(
@@ -61,7 +76,7 @@ class SViTETiny(VisionTransformerDistilled):
             raise ValueError("image_size must be a positive multiple of 16.")
         super().__init__(
             img_size=image_size, patch_size=16, num_classes=num_classes,
-            embed_dim=192, depth=12, num_heads=3, mlp_ratio=4,
+            embed_dim=192, depth=12, num_heads=3, mlp_ratio=4, # D -> 4D -> D
             qkv_bias=True, norm_layer=partial(nn.LayerNorm, eps=1e-6),
             drop_rate=0.0, pos_drop_rate=0.0, proj_drop_rate=0.0,
             attn_drop_rate=0.0, drop_path_rate=drop_path_rate,

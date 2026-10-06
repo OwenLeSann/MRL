@@ -27,14 +27,14 @@ class SparseLinear(nn.Linear):
 
 
 def erdos_renyi_counts(shapes, density):
-    """Exact integer budget with ER densities proportional to (in+out)/(in*out)."""
+    """Exact integer budget with ER densities proportional to (in+out)/(in*out), equality scaled by factor of density (epsilon)."""
     if not 0 < density <= 1:
         raise ValueError("density must be in (0, 1].")
     sizes = [math.prod(shape) for shape in shapes]
     budget = round(sum(sizes) * density)
     if not sizes or budget < 1:
         raise ValueError("The sparse budget must contain at least one connection.")
-    rates = [sum(shape) / size for shape, size in zip(shapes, sizes)]
+    rates = [sum(shape) / size for shape, size in zip(shapes, sizes)] # calculates the relative density of each layer based on its in/out dimensions
     dense = set()
     while True:
         remaining = [i for i in range(len(sizes)) if i not in dense]
@@ -61,9 +61,10 @@ class SparseTopology:
     prepare_update after unscaling gradients, and finish_step after AdamW.
     """
 
+    # Consider using er_epsilon = 20 (parameter setting in SET Erdos-Renyo MLP paper).
     def __init__(self, model, density=0.5, update_interval=20000,
                  end_step=1200000, initial_drop_fraction=0.5, initialize=True,
-                 er_epsilon=None):
+                 er_epsilon=20): # was set to None
         if update_interval < 1 or end_step < 1 or not 0 <= initial_drop_fraction <= 1:
             raise ValueError("Invalid sparse update schedule.")
         self.update_interval = update_interval
@@ -112,7 +113,9 @@ class SparseTopology:
 
     @torch.no_grad()
     def prepare_update(self):
-        """Keep only top candidate indices, then mask gradients before AdamW.
+        """
+        Chooses where connections could grow and prepares gradients before calling the optimizer.
+        Keep only top candidate indices, then mask gradients before AdamW.
 
         With microbatches, selection uses the gradient of their accumulated loss.
         Candidates must be inactive in the OLD topology, as the paper specifies.
@@ -133,6 +136,9 @@ class SparseTopology:
 
     @torch.no_grad()
     def finish_step(self, optimizer, skipped=False):
+        """
+        Applies topology changes to each multi-self-attention head layer after the optimizer has updated weights. If skipped, the step is not counted for growth.
+        """
         for name, module in self.layers.items():
             if not skipped and name in self.pending:
                 grow = self.pending[name]
